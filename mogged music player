@@ -1,0 +1,640 @@
+-- ============================================================
+-- MOG MUSIC PLAYER
+-- Spinning disc, real playback, PREV / PLAY / NEXT / STOP,
+-- volume - 100 + (5% per click), UI scale - 1.00 +, numbered playlist,
+-- draggable window + draggable MOG button
+-- Needs an executor with writefile + getcustomasset (+ HttpGet/request)
+-- ============================================================
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local SoundService = game:GetService("SoundService")
+local UIS = game:GetService("UserInputService")
+
+local LP = Players.LocalPlayer or Players:WaitForChild("LocalPlayer")
+local pg = LP:FindFirstChild("PlayerGui") or LP:WaitForChild("PlayerGui", 5)
+if not pg then return end
+
+-- executor helpers
+local _isfile = isfile or (syn and syn.isfile) or function() return false end
+local _writefile = writefile or (syn and syn.writefile)
+local _getasset = getcustomasset or getsynasset
+local _request = http_request or request or (syn and syn.request) or (http and http.request)
+
+local GUI_NAME = "MogMusicPlayer"
+local old = pg:FindFirstChild(GUI_NAME)
+if old then old:Destroy() end
+
+-- ===== songs =====
+local SONGS = {
+    {name = "BLUE BANDS",         url = "https://files.catbox.moe/mzvrir.mp3", file = "MOG_1.mp3"},
+    {name = "LEGACY",             url = "https://files.catbox.moe/siru6c.mp3", file = "MOG_2.mp3"},
+    {name = "PAZNERKNACKER.WAV",  url = "https://files.catbox.moe/izcvhm.mp3", file = "MOG_3.mp3"},
+    {name = "TESLA",              url = "https://files.catbox.moe/n85fch.mp3", file = "MOG_4.mp3"},
+    {name = "KING NASIR",         url = "https://files.catbox.moe/etk99y.mp3", file = "MOG_5.mp3"},
+    {name = "PURE COCAINE",       url = "https://files.catbox.moe/dvjtjk.mp3", file = "MOG_6.mp3"},
+    {name = "NUTS",               url = "https://files.catbox.moe/iyw1cb.mp3", file = "MOG_7.mp3"},
+    {name = "GELATO",             url = "https://files.catbox.moe/zf2z42.mp3", file = "MOG_8.mp3"},
+    {name = "FREAKED OUT",        url = "https://files.catbox.moe/dyt2ja.mp3", file = "MOG_9.mp3"},
+    {name = "SCAM LIKELY",        url = "https://files.catbox.moe/pr85mz.mp3", file = "MOG_10.mp3"},
+}
+
+-- ===== colors =====
+local PANEL   = Color3.fromRGB(18, 13, 26)
+local PANEL2  = Color3.fromRGB(30, 21, 46)
+local ROW     = Color3.fromRGB(33, 25, 48)
+local ROWHOV  = Color3.fromRGB(46, 36, 68)
+local SEL     = Color3.fromRGB(26, 64, 92)
+local LINE    = Color3.fromRGB(52, 40, 76)
+local HOT     = Color3.fromRGB(79, 195, 247)   -- light blue accent
+local HOT2    = Color3.fromRGB(150, 224, 255)
+local DIM     = Color3.fromRGB(150, 138, 178)
+local WHITE   = Color3.fromRGB(255, 255, 255)
+local INK     = Color3.fromRGB(6, 26, 48) -- dark text on light blue
+
+-- ===== state =====
+local songIdx = 1
+local playing = false
+local statusText = "Ready"
+local sound = nil
+local token = 0
+local assetCache = {}
+local conns = {}
+local volPct = 100      -- shown as 100, goes up/down 5 per click (0-200)
+local uiScaleVal = 1.0  -- shown as 1.00, goes up/down 0.05 per click
+
+-- ===== helpers =====
+local function corner(parent, r)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = r
+    c.Parent = parent
+    return c
+end
+
+local function stroke(parent, color, thick, trans)
+    local s = Instance.new("UIStroke")
+    s.Color = color
+    s.Thickness = thick or 1
+    s.Transparency = trans or 0
+    s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    s.Parent = parent
+    return s
+end
+
+local function makeButton(parent, text, size, pos, bg, textColor, textSize)
+    local b = Instance.new("TextButton")
+    b.Size = size
+    b.Position = pos
+    b.BackgroundColor3 = bg
+    b.BorderSizePixel = 0
+    b.AutoButtonColor = false
+    b.Text = text
+    b.TextColor3 = textColor
+    b.Font = Enum.Font.GothamBlack
+    b.TextSize = textSize or 13
+    b.Parent = parent
+    return b
+end
+
+local function makeLabel(parent, text, size, pos, font, textSize, color, align)
+    local l = Instance.new("TextLabel")
+    l.Size = size
+    l.Position = pos
+    l.BackgroundTransparency = 1
+    l.Text = text
+    l.Font = font
+    l.TextSize = textSize
+    l.TextColor3 = color
+    l.TextXAlignment = align or Enum.TextXAlignment.Left
+    l.Parent = parent
+    return l
+end
+
+local function hover(btn, base, over)
+    btn.MouseEnter:Connect(function()
+        TweenService:Create(btn, TweenInfo.new(0.12), {BackgroundColor3 = over}):Play()
+    end)
+    btn.MouseLeave:Connect(function()
+        TweenService:Create(btn, TweenInfo.new(0.12), {BackgroundColor3 = base}):Play()
+    end)
+end
+
+local function round2(x)
+    return math.floor(x * 100 + 0.5) / 100
+end
+
+-- drag anything; onTap fires only if the pointer didn't move (a real click)
+local function makeDraggable(obj, onTap)
+    local dragging, moved = false, false
+    local startMouse, startPos
+    obj.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            moved = false
+            startMouse = input.Position
+            startPos = obj.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    local wasDragging = dragging
+                    dragging = false
+                    if wasDragging and not moved and onTap then onTap() end
+                end
+            end)
+        end
+    end)
+    table.insert(conns, UIS.InputChanged:Connect(function(input)
+        if not dragging then return end
+        if input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch then
+            local d = input.Position - startMouse
+            if d.Magnitude > 4 then moved = true end
+            if moved then
+                obj.Position = UDim2.new(
+                    startPos.X.Scale, startPos.X.Offset + d.X,
+                    startPos.Y.Scale, startPos.Y.Offset + d.Y)
+            end
+        end
+    end))
+end
+
+-- ===== gui =====
+local gui = Instance.new("ScreenGui")
+gui.Name = GUI_NAME
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.DisplayOrder = 60
+gui.Parent = pg
+
+-- MOG button (shows when the player is closed)
+local musicPlaced = false
+local musicBtn = makeButton(gui, "MOG", UDim2.new(0, 170, 0, 54),
+    UDim2.new(0.5, -85, 0.5, -27), Color3.fromRGB(0, 0, 0), WHITE, 22)
+musicBtn.Visible = false
+musicBtn.Active = true
+corner(musicBtn, UDim.new(1, 0))
+stroke(musicBtn, Color3.fromRGB(60, 60, 60), 3)
+
+-- main window
+local WIN_W, WIN_H = 380, 730
+local main = Instance.new("Frame")
+main.Name = "Main"
+main.Size = UDim2.new(0, WIN_W, 0, WIN_H)
+main.Position = UDim2.new(0.5, -WIN_W / 2, 0.5, -WIN_H / 2)
+main.BackgroundColor3 = PANEL
+main.BorderSizePixel = 0
+main.Active = true
+main.ClipsDescendants = true
+main.Parent = gui
+corner(main, UDim.new(0, 22))
+stroke(main, LINE, 2)
+
+local mainGrad = Instance.new("UIGradient")
+mainGrad.Color = ColorSequence.new(PANEL2, PANEL)
+mainGrad.Rotation = 70
+mainGrad.Parent = main
+
+-- shrink on small screens so the tall window always fits, then apply UI Scale on top
+local cam = workspace.CurrentCamera
+local viewH = (cam and cam.ViewportSize.Y) or 800
+local fitScale = math.clamp((viewH - 30) / WIN_H, 0.4, 1)
+local function targetScale()
+    return math.clamp(fitScale * uiScaleVal, 0.25, 2)
+end
+local mainScale = Instance.new("UIScale")
+mainScale.Scale = targetScale()
+mainScale.Parent = main
+
+-- ===== header =====
+makeLabel(main, "MOG MUSIC PLAYER", UDim2.new(1, -80, 0, 32), UDim2.new(0, 18, 0, 12),
+    Enum.Font.GothamBold, 17, WHITE)
+
+local closeBtn = makeButton(main, "X", UDim2.new(0, 32, 0, 32),
+    UDim2.new(1, -48, 0, 12), ROW, HOT, 14)
+corner(closeBtn, UDim.new(0, 10))
+hover(closeBtn, ROW, ROWHOV)
+
+local divider = Instance.new("Frame")
+divider.Size = UDim2.new(1, -28, 0, 1)
+divider.Position = UDim2.new(0, 14, 0, 56)
+divider.BackgroundColor3 = LINE
+divider.BorderSizePixel = 0
+divider.Parent = main
+
+-- ===== disc =====
+local disc = Instance.new("Frame")
+disc.Name = "Disc"
+disc.Size = UDim2.new(0, 160, 0, 160)
+disc.Position = UDim2.new(0.5, -80, 0, 70)
+disc.BackgroundColor3 = Color3.fromRGB(10, 8, 14)
+disc.BorderSizePixel = 0
+disc.Parent = main
+corner(disc, UDim.new(1, 0))
+stroke(disc, Color3.fromRGB(46, 34, 72), 5)
+
+for _, scale in ipairs({0.90, 0.78, 0.66, 0.54}) do
+    local ring = Instance.new("Frame")
+    ring.AnchorPoint = Vector2.new(0.5, 0.5)
+    ring.Position = UDim2.new(0.5, 0, 0.5, 0)
+    ring.Size = UDim2.new(scale, 0, scale, 0)
+    ring.BackgroundTransparency = 1
+    ring.BorderSizePixel = 0
+    ring.Parent = disc
+    corner(ring, UDim.new(1, 0))
+    stroke(ring, Color3.fromRGB(44, 40, 56), 1.5, 0.2)
+end
+
+-- sheen (rotates with the disc so you can see it rolling)
+local sheen = Instance.new("Frame")
+sheen.Size = UDim2.new(1, 0, 1, 0)
+sheen.BackgroundColor3 = WHITE
+sheen.BorderSizePixel = 0
+sheen.Parent = disc
+corner(sheen, UDim.new(1, 0))
+local sheenGrad = Instance.new("UIGradient")
+sheenGrad.Rotation = 40
+sheenGrad.Transparency = NumberSequence.new({
+    NumberSequenceKeypoint.new(0, 1),
+    NumberSequenceKeypoint.new(0.16, 0.7),
+    NumberSequenceKeypoint.new(0.34, 1),
+    NumberSequenceKeypoint.new(0.62, 1),
+    NumberSequenceKeypoint.new(0.8, 0.74),
+    NumberSequenceKeypoint.new(1, 1),
+})
+sheenGrad.Parent = sheen
+
+-- center label (white ring, black hole, white dot)
+local label = Instance.new("Frame")
+label.AnchorPoint = Vector2.new(0.5, 0.5)
+label.Position = UDim2.new(0.5, 0, 0.5, 0)
+label.Size = UDim2.new(0, 56, 0, 56)
+label.BackgroundColor3 = Color3.fromRGB(232, 232, 238)
+label.BorderSizePixel = 0
+label.Parent = disc
+corner(label, UDim.new(1, 0))
+stroke(label, Color3.fromRGB(150, 150, 160), 2)
+
+local hole = Instance.new("Frame")
+hole.AnchorPoint = Vector2.new(0.5, 0.5)
+hole.Position = UDim2.new(0.5, 0, 0.5, 0)
+hole.Size = UDim2.new(0, 26, 0, 26)
+hole.BackgroundColor3 = Color3.fromRGB(8, 8, 10)
+hole.BorderSizePixel = 0
+hole.Parent = label
+corner(hole, UDim.new(1, 0))
+
+local dot = Instance.new("Frame")
+dot.AnchorPoint = Vector2.new(0.5, 0.5)
+dot.Position = UDim2.new(0.5, 0, 0.5, 0)
+dot.Size = UDim2.new(0, 7, 0, 7)
+dot.BackgroundColor3 = WHITE
+dot.BorderSizePixel = 0
+dot.Parent = hole
+corner(dot, UDim.new(1, 0))
+
+-- ===== now playing =====
+local statusLbl = makeLabel(main, "", UDim2.new(1, -32, 0, 16), UDim2.new(0, 16, 0, 238),
+    Enum.Font.Gotham, 12, DIM, Enum.TextXAlignment.Center)
+
+local nowLbl = makeLabel(main, "", UDim2.new(1, -32, 0, 28), UDim2.new(0, 16, 0, 256),
+    Enum.Font.GothamBlack, 20, WHITE, Enum.TextXAlignment.Center)
+nowLbl.TextTruncate = Enum.TextTruncate.AtEnd
+
+-- ===== controls: PREV / PLAY / NEXT / STOP =====
+local function ctlBtn(text, x, bg, tc)
+    local b = makeButton(main, text, UDim2.new(0, 78, 0, 40), UDim2.new(0, x, 0, 298), bg, tc, 12)
+    corner(b, UDim.new(0, 10))
+    return b
+end
+local prevBtn = ctlBtn("PREV", 22, ROW, WHITE)
+local playBtn = ctlBtn("PLAY", 108, HOT, INK)
+local nextBtn = ctlBtn("NEXT", 194, ROW, WHITE)
+local stopBtn = ctlBtn("STOP", 280, ROW, WHITE)
+hover(prevBtn, ROW, ROWHOV)
+hover(nextBtn, ROW, ROWHOV)
+hover(stopBtn, ROW, ROWHOV)
+hover(playBtn, HOT, HOT2)
+
+-- ===== settings rows: Volume and UI Scale =====
+local function settingRow(name, y, startText)
+    local rowF = Instance.new("Frame")
+    rowF.Size = UDim2.new(1, -28, 0, 42)
+    rowF.Position = UDim2.new(0, 14, 0, y)
+    rowF.BackgroundColor3 = ROW
+    rowF.BorderSizePixel = 0
+    rowF.Parent = main
+    corner(rowF, UDim.new(0, 10))
+
+    makeLabel(rowF, name, UDim2.new(0, 120, 1, 0), UDim2.new(0, 14, 0, 0),
+        Enum.Font.GothamBold, 12, WHITE)
+
+    local minus = makeButton(rowF, "-", UDim2.new(0, 30, 0, 28), UDim2.new(1, -150, 0.5, -14), ROWHOV, WHITE, 16)
+    corner(minus, UDim.new(0, 8))
+    local value = makeLabel(rowF, startText, UDim2.new(0, 60, 1, 0), UDim2.new(1, -118, 0, 0),
+        Enum.Font.GothamBold, 13, WHITE, Enum.TextXAlignment.Center)
+    local plus = makeButton(rowF, "+", UDim2.new(0, 30, 0, 28), UDim2.new(1, -44, 0.5, -14), ROWHOV, WHITE, 16)
+    corner(plus, UDim.new(0, 8))
+    hover(minus, ROWHOV, LINE)
+    hover(plus, ROWHOV, LINE)
+    return minus, value, plus
+end
+
+local volMinus, volVal, volPlus = settingRow("Volume", 352, tostring(volPct))
+local scaleMinus, scaleVal, scalePlus = settingRow("UI Scale", 402, string.format("%.2f", uiScaleVal))
+
+-- ===== playlist =====
+makeLabel(main, "Playlist", UDim2.new(1, -32, 0, 16), UDim2.new(0, 18, 0, 456),
+    Enum.Font.GothamBold, 12, DIM)
+
+local list = Instance.new("ScrollingFrame")
+list.Size = UDim2.new(1, -28, 0, 248)
+list.Position = UDim2.new(0, 14, 0, 478)
+list.BackgroundTransparency = 1
+list.BorderSizePixel = 0
+list.ScrollBarThickness = 3
+list.ScrollBarImageColor3 = HOT
+list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+list.CanvasSize = UDim2.new(0, 0, 0, 0)
+list.Parent = main
+
+local layout = Instance.new("UIListLayout")
+layout.Padding = UDim.new(0, 5)
+layout.SortOrder = Enum.SortOrder.LayoutOrder
+layout.Parent = list
+
+local rows = {}
+local nums = {}
+
+local function refresh()
+    nowLbl.Text = SONGS[songIdx].name
+    statusLbl.Text = statusText
+    for i, row in ipairs(rows) do
+        local on = (i == songIdx)
+        row.BackgroundColor3 = on and SEL or ROW
+        nums[i].TextColor3 = on and HOT or DIM
+    end
+end
+
+local function scrollToSelected()
+    local y = (songIdx - 1) * 39
+    local maxY = math.max(0, list.AbsoluteCanvasSize.Y - list.AbsoluteSize.Y)
+    list.CanvasPosition = Vector2.new(0, math.clamp(y - 40, 0, maxY))
+end
+
+-- ===== audio =====
+local downloading = {}
+
+local function fetchAsset(option)
+    local hasFile = false
+    pcall(function() hasFile = _isfile(option.file) end)
+
+    if not hasFile then
+        local data
+        pcall(function() data = game:HttpGet(option.url) end)
+        if (not data or #data == 0) and _request then
+            pcall(function()
+                local res = _request({Url = option.url, Method = "GET"})
+                if res then data = res.Body or res.body end
+            end)
+        end
+        if not data or #data == 0 or not _writefile then return nil end
+        local ok = pcall(function() _writefile(option.file, data) end)
+        if not ok then return nil end
+    end
+
+    local ok, asset = pcall(function() return _getasset(option.file) end)
+    if ok and asset then
+        assetCache[option.file] = asset
+        return asset
+    end
+    return nil
+end
+
+local function getAsset(option)
+    if assetCache[option.file] then return assetCache[option.file] end
+    if not _getasset then return nil end
+    -- already being downloaded (background preload): wait for it, don't download twice
+    if downloading[option.file] then
+        local t0 = tick()
+        while downloading[option.file] and tick() - t0 < 30 do task.wait(0.03) end
+        return assetCache[option.file]
+    end
+    downloading[option.file] = true
+    local asset = fetchAsset(option)
+    downloading[option.file] = nil
+    return asset
+end
+
+local function killSound()
+    token = token + 1
+    if sound then
+        pcall(function() sound:Stop() end)
+        pcall(function() sound:Destroy() end)
+        sound = nil
+    end
+end
+
+local playSong
+
+local function stopAll()
+    killSound()
+    playing = false
+    statusText = "Stopped"
+    refresh()
+end
+
+playSong = function(idx)
+    songIdx = idx
+    killSound()
+    local my = token
+    playing = true
+    statusText = "Loading..."
+    refresh()
+
+    task.spawn(function()
+        local asset = getAsset(SONGS[idx])
+        if my ~= token then return end
+        if not asset then
+            playing = false
+            statusText = "Could not load (needs writefile + getcustomasset)"
+            refresh()
+            return
+        end
+
+        local s = Instance.new("Sound")
+        s.Name = "MogMusic"
+        s.Volume = volPct / 100
+        s.Looped = false
+        s.SoundId = asset
+        s.Parent = SoundService
+        sound = s
+
+        local t0 = tick()
+        while s.Parent and not s.IsLoaded and tick() - t0 < 15 do
+            task.wait(0.02)
+        end
+        if my ~= token then
+            pcall(function() s:Destroy() end)
+            return
+        end
+        if not s.IsLoaded then
+            killSound()
+            playing = false
+            statusText = "Could not load"
+            refresh()
+            return
+        end
+
+        s:Play()
+        statusText = "Now Playing"
+        refresh()
+
+        -- when a song ends, roll into the next one
+        s.Ended:Connect(function()
+            if my == token then
+                local nextIdx = songIdx % #SONGS + 1
+                playSong(nextIdx)
+                scrollToSelected()
+            end
+        end)
+    end)
+end
+
+-- ===== playlist rows =====
+for i, option in ipairs(SONGS) do
+    local row = Instance.new("TextButton")
+    row.Size = UDim2.new(1, -8, 0, 34)
+    row.BackgroundColor3 = ROW
+    row.BorderSizePixel = 0
+    row.AutoButtonColor = false
+    row.Text = ""
+    row.LayoutOrder = i
+    row.Parent = list
+    corner(row, UDim.new(0, 8))
+    rows[i] = row
+
+    nums[i] = makeLabel(row, tostring(i), UDim2.new(0, 26, 1, 0), UDim2.new(0, 12, 0, 0),
+        Enum.Font.GothamBold, 11, DIM)
+    local nameLbl = makeLabel(row, option.name, UDim2.new(1, -56, 1, 0), UDim2.new(0, 46, 0, 0),
+        Enum.Font.GothamBold, 13, WHITE)
+    nameLbl.TextTruncate = Enum.TextTruncate.AtEnd
+
+    row.MouseEnter:Connect(function()
+        if i ~= songIdx then row.BackgroundColor3 = ROWHOV end
+    end)
+    row.MouseLeave:Connect(function()
+        if i ~= songIdx then row.BackgroundColor3 = ROW end
+    end)
+    row.MouseButton1Click:Connect(function()
+        playSong(i)
+    end)
+end
+
+-- ===== button behavior =====
+playBtn.MouseButton1Click:Connect(function()
+    if not playing then
+        playSong(songIdx)
+    end
+end)
+
+stopBtn.MouseButton1Click:Connect(function()
+    stopAll()
+end)
+
+nextBtn.MouseButton1Click:Connect(function()
+    local idx = songIdx % #SONGS + 1
+    if playing then
+        playSong(idx)
+    else
+        songIdx = idx
+        refresh()
+    end
+    scrollToSelected()
+end)
+
+prevBtn.MouseButton1Click:Connect(function()
+    local idx = (songIdx - 2) % #SONGS + 1
+    if playing then
+        playSong(idx)
+    else
+        songIdx = idx
+        refresh()
+    end
+    scrollToSelected()
+end)
+
+-- volume: 5% per click (0 - 200)
+local function setVolume(v)
+    volPct = math.clamp(v, 0, 200)
+    volVal.Text = tostring(volPct)
+    if sound then sound.Volume = volPct / 100 end
+end
+volMinus.MouseButton1Click:Connect(function() setVolume(volPct - 5) end)
+volPlus.MouseButton1Click:Connect(function() setVolume(volPct + 5) end)
+
+-- UI scale: 0.05 per click (0.50 - 1.50)
+local function setUIScale(v)
+    uiScaleVal = math.clamp(round2(v), 0.5, 1.5)
+    scaleVal.Text = string.format("%.2f", uiScaleVal)
+    TweenService:Create(mainScale, TweenInfo.new(0.12, Enum.EasingStyle.Quad), {Scale = targetScale()}):Play()
+end
+scaleMinus.MouseButton1Click:Connect(function() setUIScale(uiScaleVal - 0.05) end)
+scalePlus.MouseButton1Click:Connect(function() setUIScale(uiScaleVal + 0.05) end)
+
+-- ===== close / MOG button =====
+local function openPlayer()
+    musicBtn.Visible = false
+    mainScale.Scale = 0.01
+    main.Visible = true
+    TweenService:Create(mainScale, TweenInfo.new(0.35, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {Scale = targetScale()}):Play()
+end
+
+closeBtn.MouseButton1Click:Connect(function()
+    -- first close only: put the MOG button where the window was.
+    -- after that it stays wherever you left it until you drag it again
+    if not musicPlaced then
+        musicPlaced = true
+        local p = main.Position
+        musicBtn.Position = UDim2.new(p.X.Scale, p.X.Offset + WIN_W / 2 - 85, p.Y.Scale, p.Y.Offset + 60)
+    end
+    local t = TweenService:Create(mainScale, TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {Scale = 0.01})
+    t:Play()
+    t.Completed:Wait()
+    main.Visible = false
+    musicBtn.Visible = true
+end)
+
+-- drag the whole window (press on any empty part of it) and the MOG button
+makeDraggable(main)
+makeDraggable(musicBtn, openPlayer)
+
+-- ===== disc rolling (spins while a song is loading or playing) =====
+local SPIN_SPEED = 150 -- degrees per second
+table.insert(conns, RunService.RenderStepped:Connect(function(dt)
+    if playing then
+        disc.Rotation = (disc.Rotation + SPIN_SPEED * dt) % 360
+    end
+end))
+
+gui.Destroying:Connect(function()
+    killSound()
+    for _, c in ipairs(conns) do
+        pcall(function() c:Disconnect() end)
+    end
+end)
+
+refresh()
+
+-- preload every song in the background (selected song first) so clicks start instantly
+task.spawn(function()
+    local order = {songIdx}
+    for i = 1, #SONGS do
+        if i ~= songIdx then table.insert(order, i) end
+    end
+    for _, i in ipairs(order) do
+        if not gui.Parent then break end
+        getAsset(SONGS[i])
+    end
+end)
+
+print("[MOG MUSIC PLAYER] loaded")
